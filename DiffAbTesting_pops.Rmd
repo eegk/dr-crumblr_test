@@ -1,0 +1,736 @@
+---
+title: "Differential Abundance testing"
+author: "Edgar Gonzalez-Kozlova"
+date: "Oct 2024"
+output: 
+  html_document:
+  toc: true
+  toc_depth: 2
+  toc_float: true
+  ighlight: espresso
+number_sections: yes
+theme: cerulean
+---
+
+## Analysis
+
+### Libraries
+
+```{r echo=TRUE, message=FALSE, warning=FALSE, paged.print=FALSE, results='hide'}
+
+list.of.packages <- c('crumblr',"variancePartition",'DirichletReg','limma',
+                      'reshape','reshape2','pheatmap','tsne','ggplot2','mclust','grid','Rtsne','cccd',"BiostatsALL",'dplyr',
+                      'rmarkdown','rms','circlize',"swimplot",'ggrepel',"ggsci","clustree",'doParallel','ComplexHeatmap',
+                      'ComplexHeatmap',"ggpubr","factoextra","scales","tibble","RColorBrewer","ggdendro",'anndata','pals',
+                      "colorspace","Vennerable","cowplot","data.table","viridis","ggbeeswarm","tidyverse","dendextend")
+new.packages <- list.of.packages[!(list.of.packages %in% installed.packages()[,"Package"])]
+if(length(new.packages)) install.packages(new.packages, repos=c("http://cran.rstudio.com/", "https://bioconductor.org/biocLite.R"))
+### if (!requireNamespace("BiocManager", quietly = TRUE)) ; install.packages("BiocManager") ; BiocManager::install("FlowSOM")
+lapply(list.of.packages, require, character.only = TRUE) ; rm(new.packages,list.of.packages)
+```
+
+
+### Datasets
+
+#### Real dataset
+
+From Kang, et al. (2018) https://doi.org/10.1038/nbt.4042
+
+```{r message=FALSE, warning=FALSE}
+data(IFNCellCounts)
+```
+
+
+```{r message=FALSE, warning=FALSE}
+flat_cellCounts <- melt(df_cellCounts)
+flat_cellCounts$condition <- as.character(flat_cellCounts$Var1)
+flat_cellCounts$condition[grep('ctrl',flat_cellCounts$condition)] <- 'ctrl'
+flat_cellCounts$condition[grep('stim',flat_cellCounts$condition)] <- 'stim'
+head(flat_cellCounts)
+```
+
+```{r message=FALSE, warning=FALSE,fig.width=5,fig.height=4}
+ggplot(data=flat_cellCounts) + aes(x=Var2,y=value,fill=condition) + theme_classic() + 
+  geom_boxplot() + rotate_x_text(angle = 69) + theme(legend.position = 'bottom') + 
+  labs(x='Pops',y='Freq')
+```
+
+```{r message=FALSE, warning=FALSE,fig.width=7,fig.height=4}
+ggplot(data=flat_cellCounts) + aes(x=Var2,y=value,fill=condition) + theme_classic() + 
+  facet_wrap(~Var2,ncol=9,scales = 'free') +
+  geom_boxplot() + rotate_x_text(angle = 69) + theme(legend.position = 'bottom') + 
+  labs(x='Pops',y='Freq')
+```
+
+#### Simulated dataset
+
+```{r message=FALSE, warning=FALSE}
+# Set parameters
+set.seed(123)  # For reproducibility
+
+n_samples <- 10   # Samples per condition
+n_pops <- 80      # Number of cell populations
+### logFC_range <- seq(0, 1, length.out = n_pops)  # LogFC differences for each population
+logFC_values <- c(0.1, 0.25, 0.5, 1)
+logFC_range <- sort(rep(logFC_values, length.out = n_pops))
+
+# Population names
+populations <- paste('pop',rep(1:n_pops),sep='')
+
+# Initialize empty data frames for storing the results
+control_data <- matrix(NA, nrow = n_samples, ncol = n_pops)
+stim_data <- matrix(NA, nrow = n_samples, ncol = n_pops)
+
+# Simulate data for each population
+for (i in 1:n_pops) {
+  
+  # Baseline mean (for control condition) for each population
+  baseline_mean <- sample(10:1000, 1)
+  
+  # Introduce random variation (e.g., standard deviation is 0.1 * baseline mean)
+  control_sd <- baseline_mean * 0.3  # 30% standard deviation for variation
+  
+  # Generate control samples for population i with random variation
+  control_data[, i] <- rpois(n_samples, baseline_mean) + rnorm(n_samples, mean = 0, sd = control_sd)
+  
+  # Generate stimulated samples for population i with logFC differences and variation
+  stim_mean <- baseline_mean * 2^logFC_range[i]  # Adjust the mean based on logFC
+  stim_sd <- stim_mean * 0.3  # 30% standard deviation for variation
+  stim_data[, i] <- rpois(n_samples, stim_mean) + rnorm(n_samples, mean = 0, sd = stim_sd)
+  
+  # Ensure no negative values due to normal noise (clip at zero)
+  control_data[, i] <- pmax(0, control_data[, i])
+  stim_data[, i] <- pmax(0, stim_data[, i])
+}
+
+# Convert to data frames and add sample labels
+control_df <- as.data.frame(control_data)
+stim_df <- as.data.frame(stim_data)
+
+# Assign population names as column names
+colnames(control_df) <- populations
+colnames(stim_df) <- populations
+
+# Add sample identifiers
+control_df$Sample <- paste0("ctrl", 1:n_samples)
+stim_df$Sample <- paste0("stim", 1:n_samples)
+
+# Combine control and stimulated datasets
+final_data <- bind_rows(
+  control_df %>% mutate(Condition = "Control"),
+  stim_df %>% mutate(Condition = "Stimulated")
+)
+
+# Reorder columns
+final_data <- final_data %>% select(Sample, Condition, everything())
+
+
+simulated_data <- final_data
+simulated_data$Condition<-NULL
+rownames(simulated_data) <- simulated_data$Sample
+simulated_data$Sample <- NULL
+
+# Print the final simulated dataset
+head(simulated_data)
+```
+
+
+```{r message=FALSE, warning=FALSE}
+rm(list=setdiff(ls(), c('simulated_data','info','df_cellCounts','flat_cellCounts') ))
+```
+
+
+```{r message=FALSE, warning=FALSE}
+flat_cellSimulation <- melt(as.matrix(simulated_data))
+flat_cellSimulation$condition <- as.character(flat_cellSimulation$Var1)
+flat_cellSimulation$condition[grep('ctrl',flat_cellSimulation$condition)] <- 'ctrl'
+flat_cellSimulation$condition[grep('stim',flat_cellSimulation$condition)] <- 'stim'
+head(flat_cellSimulation)
+```
+
+```{r message=FALSE, warning=FALSE,fig.width=10,fig.height=4}
+ggplot(data=flat_cellSimulation) + aes(x=Var2,y=value,fill=condition) + theme_classic() + 
+  geom_boxplot() + rotate_x_text(angle = 69) + theme(legend.position = 'bottom') + 
+  labs(x='Pops',y='Freq')
+```
+
+### Crumblr 
+
+```{r message=FALSE, warning=FALSE}
+# cobj is an EList object compatable with limma workflow
+# cobj$E stores transformed values
+# cobj$weights stores precision weights
+#    corresponding to the regularized inverse variance
+
+###
+cobj_count <- crumblr( df_cellCounts )
+cobj_sim <- crumblr( simulated_data )
+```
+
+```{r message=FALSE, warning=FALSE}
+flat_cellSimulation <- melt(as.matrix(cobj_sim$E))
+flat_cellSimulation$condition <- as.character(flat_cellSimulation$Var2)
+flat_cellSimulation$condition[grep('ctrl',flat_cellSimulation$condition)] <- 'ctrl'
+flat_cellSimulation$condition[grep('stim',flat_cellSimulation$condition)] <- 'stim'
+head(flat_cellSimulation)
+```
+
+
+```{r message=FALSE, warning=FALSE,fig.width=10,fig.height=4}
+ggplot(data=flat_cellSimulation) + aes(x=Var1,y=value,fill=condition) + theme_classic() + 
+  geom_boxplot() + rotate_x_text(angle = 69) + theme(legend.position = 'bottom') + 
+  labs(x='Pops',y='Freq',title = 'crumblr adj. data')
+```
+
+```{r message=FALSE, warning=FALSE}
+flat_cellCounts <- melt(as.matrix(cobj_count$E))
+flat_cellCounts$condition <- as.character(flat_cellCounts$Var2)
+flat_cellCounts$condition[grep('ctrl',flat_cellCounts$condition)] <- 'ctrl'
+flat_cellCounts$condition[grep('stim',flat_cellCounts$condition)] <- 'stim'
+head(flat_cellCounts)
+```
+
+```{r message=FALSE, warning=FALSE,fig.width=5,fig.height=4}
+ggplot(data=flat_cellCounts) + aes(x=Var1,y=value,fill=condition) + theme_classic() + 
+  geom_boxplot() + rotate_x_text(angle = 69) + theme(legend.position = 'bottom') + 
+  labs(x='Pops',y='Freq',title = 'crumblr adj. data')
+```
+
+```{r message=FALSE, warning=FALSE}
+info_sim <- data.frame(stim=rownames(simulated_data),StimStatus=rownames(simulated_data))
+rownames(info_sim) <- rownames(simulated_data)
+info_sim$StimStatus[grep('ctrl',info_sim$StimStatus)] <- 'ctrl'
+info_sim$StimStatus[grep('stim',info_sim$StimStatus)] <- 'stim'
+info_sim$ind <- info_sim$stim
+info_sim$ind <- gsub('ctrl','',info_sim$ind)
+info_sim$ind <- gsub('stim','',info_sim$ind)
+```
+
+```{r message=FALSE, warning=FALSE}
+fit <- dream(cobj_count, ~ StimStatus + ind, info)
+fit <- eBayes(fit)
+crumblr_results_real <- topTable(fit, coef = "StimStatusstim", number = Inf)
+```
+
+```{r message=FALSE, warning=FALSE}
+fit <- dream(cobj_sim, ~ StimStatus + ind, info_sim)
+fit <- eBayes(fit)
+crumblr_results_sim <- topTable(fit, coef = "StimStatusstim", number = Inf)
+```
+
+### DirichReg 
+
+```{r message=FALSE, warning=FALSE}
+cell_proportions_real <- DR_data(df_cellCounts)
+cell_proportions_sim <- DR_data(simulated_data)
+```
+
+```{r message=FALSE, warning=FALSE}
+dr_fit_common <- DirichReg( cell_proportions_real ~ StimStatus, info, model = "common" ) 
+u = summary(dr_fit_common)
+pvals = round(u$coef.mat[grep('StimStatusstim', rownames(u$coef.mat), invert=FALSE), 4],8)
+v = names(pvals)
+prob.ratio = exp( summary(dr_fit_common)$coefficients[paste0(colnames(cell_proportions_real),":StimStatusstim")] )
+pvals = round(matrix(pvals, ncol=length(u$varnames)),8)
+rownames(pvals) = gsub('StimStatusstim', '', v[1:nrow(pvals)])
+colnames(pvals) = u$varnames
+dr_res <- data.frame(log2fc = log2(exp( summary(dr_fit_common)$coefficients[paste0(colnames(cell_proportions_real),":StimStatusstim")] )),
+                     coef =  summary(dr_fit_common)$coefficients[paste0(colnames(cell_proportions_real),":StimStatusstim")], 
+                     pval=colMeans(pvals))
+###
+rownames(dr_res) <- gsub(':StimStatusstim','',rownames(dr_res))
+dr_res$prob.ratio <- prob.ratio
+###
+dr_res$fdr <- p.adjust(dr_res$pval,method = 'BH')
+dr_results_real <- dr_res
+```
+
+```{r message=FALSE, warning=FALSE}
+dr_fit_common <- DirichReg( cell_proportions_sim ~ StimStatus, info_sim, model = "common" ) 
+u = summary(dr_fit_common)
+pvals = round(u$coef.mat[grep('StimStatusstim', rownames(u$coef.mat), invert=FALSE), 4],8)
+v = names(pvals)
+prob.ratio = exp( summary(dr_fit_common)$coefficients[paste0(colnames(cell_proportions_sim),":StimStatusstim")] )
+pvals = round(matrix(pvals, ncol=length(u$varnames)),8)
+rownames(pvals) = gsub('StimStatusstim', '', v[1:nrow(pvals)])
+colnames(pvals) = u$varnames
+dr_res <- data.frame(log2fc = log2(exp( summary(dr_fit_common)$coefficients[paste0(colnames(cell_proportions_sim),":StimStatusstim")] )),
+                     coef =  summary(dr_fit_common)$coefficients[paste0(colnames(cell_proportions_sim),":StimStatusstim")], 
+                     pval=colMeans(pvals))
+###
+rownames(dr_res) <- gsub(':StimStatusstim','',rownames(dr_res))
+dr_res$prob.ratio <- prob.ratio
+###
+dr_res$fdr <- p.adjust(dr_res$pval,method = 'BH')
+dr_results_sim <- dr_res
+```
+
+### Results
+
+#### Real dataset
+
+```{r message=FALSE, warning=FALSE}
+crumblr_results_real$samples <- rownames(crumblr_results_real)    
+crumblr_results_real$samples <- factor(crumblr_results_real$samples, levels = rownames(dr_results_real))
+crumblr_results_real <- crumblr_results_real[order(crumblr_results_real$samples),]
+```
+
+```{r message=FALSE, warning=FALSE}
+identical(rownames(crumblr_results_real),rownames(dr_results_real))
+```
+
+```{r message=FALSE, warning=FALSE}
+cross_res <- data.frame(pop=rownames(crumblr_results_real),
+                        crumblr_logFC=crumblr_results_real$logFC,
+                        crumblr_pval=crumblr_results_real$P.Value,
+                        dr_res_logFC=dr_results_real$log2fc,
+                        dr_res_pval=dr_results_real$pval)
+```
+
+```{r message=FALSE, warning=FALSE,fig.width=10,fig.height=10}
+ggplot(data=cross_res) + aes(x=crumblr_logFC,y=dr_res_logFC) + geom_point() + 
+  theme_classic() + 
+  geom_hline(yintercept = 0,linetype=2) + geom_vline(xintercept = 0,linetype=2) +
+  geom_text_repel(aes(label=pop))
+```
+
+```{r message=FALSE, warning=FALSE,fig.width=10,fig.height=10}
+ggplot(data=cross_res) + aes(x=-log10(crumblr_pval),y=-log10(dr_res_pval)) + geom_point() + 
+  theme_classic() + 
+  #geom_hline(yintercept = 1.3,linetype=2) + geom_vline(xintercept = 1.3,linetype=2) +
+  geom_abline(linetype=2)+
+  geom_text_repel(aes(label=pop))
+```
+
+
+#### Simulated dataset
+
+```{r message=FALSE, warning=FALSE}
+crumblr_results_sim$samples <- rownames(crumblr_results_sim)    
+crumblr_results_sim$samples <- factor(crumblr_results_sim$samples, levels = rownames(dr_results_sim))
+crumblr_results_sim <- crumblr_results_sim[order(crumblr_results_sim$samples),]
+```
+
+```{r message=FALSE, warning=FALSE}
+identical(rownames(crumblr_results_sim),rownames(dr_results_sim))
+```
+
+```{r message=FALSE, warning=FALSE}
+cross_sim <- data.frame(pop=rownames(crumblr_results_sim),
+                        crumblr_logFC=crumblr_results_sim$logFC,
+                        crumblr_pval=crumblr_results_sim$P.Value,
+                        dr_res_logFC=dr_results_sim$log2fc,
+                        dr_res_pval=dr_results_sim$pval)
+```
+
+```{r message=FALSE, warning=FALSE,fig.width=10,fig.height=10}
+ggplot(data=cross_sim) + aes(x=crumblr_logFC,y=dr_res_logFC) + geom_point() + 
+  theme_classic() + 
+  geom_hline(yintercept = 0,linetype=2) + geom_vline(xintercept = 0,linetype=2) +
+  geom_text_repel(aes(label=pop))
+```
+
+```{r message=FALSE, warning=FALSE,fig.width=10,fig.height=10}
+ggplot(data=cross_sim) + aes(x=-log10(crumblr_pval),y=-log10(dr_res_pval)) + geom_point() + 
+  theme_classic() + 
+  #geom_hline(yintercept = 1.3,linetype=2) + geom_vline(xintercept = 1.3,linetype=2) +
+  geom_abline(linetype=2)+
+  geom_text_repel(aes(label=pop))
+
+```
+
+#### heatmap real
+
+```{r message=FALSE, warning=FALSE,fig.width=5,fig.height=3}
+### scale
+z <- as.matrix(t(scale(df_cellCounts)))
+
+#identical(rownames(df_cellCounts),rownames(info))
+
+###
+ann_col <- data.frame(StimStatus=info$StimStatus)
+
+### complex heatmap column color code annotation 
+column_ha = HeatmapAnnotation(
+  Type = anno_block(gp = gpar(fill = c('deeppink','skyblue')), 
+                      labels = c('stim','ctrl'),
+                      labels_gp = gpar(col = "black", fontsize = 10)) )
+
+
+ann_row <- data.frame( dr_logFC = dr_results_real$log2fc,
+                       dr_pval = dr_results_real$pval<0.05,
+                       crumblr_logFC = crumblr_results_real$logFC,
+                       crumblr_pval = crumblr_results_real$P.Value<0.05)
+
+
+pval_colors <- c(`TRUE` = "black", `FALSE` = "white")
+
+# Define color scale for the logFC (continuous data)
+logfc_colors <- colorRamp2(c(-1, 0, 1), c("steelblue", "white", "firebrick"))
+
+# Create row annotation for heatmap
+row_ha <- rowAnnotation(
+  dr_logFC = anno_simple(ann_row$dr_logFC, col = logfc_colors),  # Continuous logFC for dr_logFC
+  dr_pval = anno_simple(as.character(ann_row$dr_pval), col = pval_colors),     # Binary p-value for dr_pval
+  crumblr_logFC = anno_simple(ann_row$crumblr_logFC, col = logfc_colors),  # Continuous logFC for crumblr_logFC
+  crumblr_pval = anno_simple(as.character(ann_row$crumblr_pval), col = pval_colors)      # Binary p-value for crumblr_pval
+)
+
+```
+
+
+```{r message=FALSE, warning=FALSE,fig.width=7,fig.height=4}
+draw(
+  ComplexHeatmap::Heatmap(z, 
+          col= colorRampPalette(c("steelblue", "white","firebrick"))(255),
+          show_row_names = TRUE , show_column_names = FALSE,
+          #column_title_gp = gpar(fontsize = 1, fontface = "plain"), #column_names_gp = gpar(fontsize = 5, fontface = "plain"),
+          column_names_rot = 45,
+          column_split = ann_col, #column_km = 7,
+          #row_split =  ann_row, #row_split = 4, #row_km = 5,
+          clustering_method_rows = 'ward.D2', clustering_method_columns = 'ward.D2',
+          cluster_row_slices = TRUE, cluster_column_slices = TRUE,
+          top_annotation = column_ha, 
+          left_annotation = row_ha,
+          border = TRUE, use_raster = FALSE, name = "Z-Score") ,
+  
+  heatmap_legend_side = "left", annotation_legend_side = "left" , padding = unit(c(2, 2, 2, 20), "mm")
+)
+```
+
+
+#### heatmap real
+
+
+```{r message=FALSE, warning=FALSE}
+identical(rownames(simulated_data),rownames(info_sim))
+```
+
+```{r message=FALSE, warning=FALSE}
+identical(colnames(cobj_sim$E),rownames(info_sim))
+```
+
+```{r message=FALSE, warning=FALSE,fig.width=5,fig.height=3}
+### scale
+z <- as.matrix(t(scale(simulated_data)))
+
+###
+ann_col <- data.frame(StimStatus=info_sim$StimStatus)
+
+### complex heatmap column color code annotation 
+column_ha = HeatmapAnnotation(
+  Type = anno_block(gp = gpar(fill = c('deeppink','skyblue')), 
+                      labels = c('stim','ctrl'),
+                      labels_gp = gpar(col = "black", fontsize = 10)) )
+
+
+ann_row <- data.frame( dr_logFC = dr_results_sim$log2fc,
+                       dr_pval = dr_results_sim$pval<0.05,
+                       crumblr_logFC = crumblr_results_sim$logFC,
+                       crumblr_pval = crumblr_results_sim$P.Value<0.05,
+                       real_logFC = c(rep(c(0.1),20),rep(c(0.25),20),rep(c(0.5),20),rep(c(1),20)) )
+
+
+pval_colors <- c(`TRUE` = "black", `FALSE` = "white")
+
+# Define color scale for the logFC (continuous data)
+logfc_colors <- colorRamp2(c(-1, 0, 1), c("steelblue", "white", "firebrick"))
+
+# Create row annotation for heatmap
+row_ha <- rowAnnotation(
+  dr_logFC = anno_simple(ann_row$dr_logFC, col = logfc_colors),  # Continuous logFC for dr_logFC
+  dr_pval = anno_simple(as.character(ann_row$dr_pval), col = pval_colors),     # Binary p-value for dr_pval
+  crumblr_logFC = anno_simple(ann_row$crumblr_logFC, col = logfc_colors),  # Continuous logFC for crumblr_logFC
+  crumblr_pval = anno_simple(as.character(ann_row$crumblr_pval), col = pval_colors),      # Binary p-value for crumblr_pval
+  real_logFC = anno_simple( ann_row$real_logFC, col = logfc_colors)
+)
+
+```
+
+
+```{r message=FALSE, warning=FALSE,fig.width=7,fig.height=8}
+draw(
+  ComplexHeatmap::Heatmap(z, 
+          col= colorRampPalette(c("steelblue", "white","firebrick"))(255),
+          show_row_names = TRUE , show_column_names = FALSE,
+          #column_title_gp = gpar(fontsize = 1, fontface = "plain"), #column_names_gp = gpar(fontsize = 5, fontface = "plain"),
+          column_names_rot = 45,
+          column_split = ann_col, #column_km = 7,
+          #row_split =  ann_row, #row_split = 4, #row_km = 5,
+          clustering_method_rows = 'ward.D2', clustering_method_columns = 'ward.D2',
+          cluster_row_slices = TRUE, cluster_column_slices = TRUE,
+          top_annotation = column_ha, 
+          left_annotation = row_ha,
+          border = TRUE, use_raster = FALSE, name = "Z-Score") ,
+  
+  heatmap_legend_side = "left", annotation_legend_side = "left" , padding = unit(c(2, 2, 2, 20), "mm")
+)
+```
+
+```{r message=FALSE, warning=FALSE}
+cor.test(ann_row$dr_logFC,ann_row$real_logFC)
+```
+
+```{r message=FALSE, warning=FALSE}
+cor.test(ann_row$crumblr_logFC,ann_row$real_logFC)
+```
+
+
+#### Simulated dataset V2 (Simplifying)
+
+```{r message=FALSE, warning=FALSE}
+# Set parameters
+set.seed(123)  # For reproducibility
+
+n_samples <- 10   # Samples per condition
+n_pops <- 12    # Number of cell populations
+### logFC_range <- seq(0, 1, length.out = n_pops)  # LogFC differences for each population
+logFC_values <- c(0.1, 0.25, 0.5, 1)
+logFC_range <- sort(rep(logFC_values, length.out = n_pops))
+
+# Population names
+populations <- paste('pop',rep(1:n_pops),sep='')
+
+# Initialize empty data frames for storing the results
+control_data <- matrix(NA, nrow = n_samples, ncol = n_pops)
+stim_data <- matrix(NA, nrow = n_samples, ncol = n_pops)
+
+# Simulate data for each population
+for (i in 1:n_pops) {
+  
+  # Baseline mean (for control condition) for each population
+  baseline_mean <- sample(10:1000, 1)
+  
+  # Introduce random variation (e.g., standard deviation is 0.1 * baseline mean)
+  control_sd <- baseline_mean * 0.3  # 30% standard deviation for variation
+  
+  # Generate control samples for population i with random variation
+  control_data[, i] <- rpois(n_samples, baseline_mean) + rnorm(n_samples, mean = 0, sd = control_sd)
+  
+  # Generate stimulated samples for population i with logFC differences and variation
+  stim_mean <- baseline_mean * 2^logFC_range[i]  # Adjust the mean based on logFC
+  stim_sd <- stim_mean * 0.3  # 30% standard deviation for variation
+  stim_data[, i] <- rpois(n_samples, stim_mean) + rnorm(n_samples, mean = 0, sd = stim_sd)
+  
+  # Ensure no negative values due to normal noise (clip at zero)
+  control_data[, i] <- pmax(0, control_data[, i])
+  stim_data[, i] <- pmax(0, stim_data[, i])
+}
+
+# Convert to data frames and add sample labels
+control_df <- as.data.frame(control_data)
+stim_df <- as.data.frame(stim_data)
+
+# Assign population names as column names
+colnames(control_df) <- populations
+colnames(stim_df) <- populations
+
+# Add sample identifiers
+control_df$Sample <- paste0("ctrl", 1:n_samples)
+stim_df$Sample <- paste0("stim", 1:n_samples)
+
+# Combine control and stimulated datasets
+final_data <- bind_rows(
+  control_df %>% mutate(Condition = "Control"),
+  stim_df %>% mutate(Condition = "Stimulated")
+)
+
+# Reorder columns
+final_data <- final_data %>% select(Sample, Condition, everything())
+
+simulated_data <- final_data
+simulated_data$Condition<-NULL
+rownames(simulated_data) <- simulated_data$Sample
+simulated_data$Sample <- NULL
+
+# Print the final simulated dataset
+head(simulated_data)
+```
+
+```{r message=FALSE, warning=FALSE,fig.width=5,fig.height=4}
+flat_cellCounts <- melt(as.matrix(simulated_data))
+flat_cellCounts$condition <- as.character(flat_cellCounts$Var1)
+flat_cellCounts$condition[grep('stim',flat_cellCounts$condition)] <- 'stim'
+flat_cellCounts$condition[grep('ctrl',flat_cellCounts$condition)] <- 'ctrl'
+
+ggplot(data=flat_cellCounts) + aes(x=Var2,y=value,fill=condition) + theme_classic() + 
+  geom_boxplot() + rotate_x_text(angle = 69) + theme(legend.position = 'bottom') + 
+  labs(x='Pops',y='Freq')
+```
+
+```{r message=FALSE, warning=FALSE,fig.width=5,fig.height=4}
+my_samples <- levels(flat_cellCounts$Var1)
+flat_cellCounts$percent <- NA
+for(i in 1:length(my_samples)){
+  ix <- which(flat_cellCounts$Var1 %in% my_samples[i])
+  flat_cellCounts$percent[ix] <- flat_cellCounts$value[ix]/sum(flat_cellCounts$value[ix])
+}
+
+ggplot(data=flat_cellCounts) + aes(x=Var1,y=percent,fill=Var2) + theme_classic() + 
+  geom_bar(stat='identity') + rotate_x_text(angle = 69) + theme(legend.position = 'bottom') + 
+  labs(x='Pops',y='Percent') + scale_fill_manual(values = pals::glasbey(12))
+```
+
+
+```{r message=FALSE, warning=FALSE,fig.width=5,fig.height=4}
+ggplot(data=flat_cellCounts) + aes(x=Var2,y=percent,fill=condition) + theme_classic() + 
+  geom_boxplot() + rotate_x_text(angle = 69) + theme(legend.position = 'bottom') + 
+  labs(x='Pops',y='Percent') 
+```
+
+
+```{r message=FALSE, warning=FALSE}
+cobj_count <- crumblr( simulated_data )
+DR_count <- DR_data(simulated_data)
+```
+
+
+```{r message=FALSE, warning=FALSE,fig.width=5,fig.height=4}
+flat_crumblr <- melt(as.matrix(cobj_count$E))
+flat_crumblr$condition <- as.character(flat_crumblr$Var2)
+flat_crumblr$condition[grep('stim',flat_crumblr$condition)] <- 'stim'
+flat_crumblr$condition[grep('ctrl',flat_crumblr$condition)] <- 'ctrl'
+
+ggplot(data=flat_crumblr) + aes(x=Var1,y=value,fill=condition) + theme_classic() + 
+  geom_boxplot() + rotate_x_text(angle = 69) + theme(legend.position = 'bottom') + 
+  labs(x='Pops',y='Freq')
+```
+
+```{r message=FALSE, warning=FALSE,fig.width=5,fig.height=4}
+flat_dr <- melt(as.matrix(DR_count[,]))
+flat_dr$condition <- as.character(flat_dr$Var1)
+flat_dr$condition[grep('stim',flat_dr$condition)] <- 'stim'
+flat_dr$condition[grep('ctrl',flat_dr$condition)] <- 'ctrl'
+
+ggplot(data=flat_dr) + aes(x=Var2,y=value,fill=condition) + theme_classic() + 
+  geom_boxplot() + rotate_x_text(angle = 69) + theme(legend.position = 'bottom') + 
+  labs(x='Pops',y='Freq')
+```
+
+```{r message=FALSE, warning=FALSE}
+info_sim <- data.frame(stim=rownames(simulated_data),StimStatus=rownames(simulated_data))
+rownames(info_sim) <- rownames(simulated_data)
+info_sim$StimStatus[grep('ctrl',info_sim$StimStatus)] <- 'ctrl'
+info_sim$StimStatus[grep('stim',info_sim$StimStatus)] <- 'stim'
+info_sim$ind <- info_sim$stim
+info_sim$ind <- gsub('ctrl','',info_sim$ind)
+info_sim$ind <- gsub('stim','',info_sim$ind)
+```
+
+```{r message=FALSE, warning=FALSE}
+fit <- dream(cobj_count, ~ StimStatus + (1|ind), info_sim)
+fit <- eBayes(fit)
+crumblr_results_sim_V2 <- topTable(fit, coef = "StimStatusstim", number = Inf)
+```
+
+
+```{r message=FALSE, warning=FALSE}
+dr_fit_common <- DirichReg( DR_count ~ StimStatus, info_sim, model = "common" ) 
+u = summary(dr_fit_common)
+pvals = round(u$coef.mat[grep('StimStatusstim', rownames(u$coef.mat), invert=FALSE), 4],8)
+v = names(pvals)
+prob.ratio = exp( summary(dr_fit_common)$coefficients[paste0(colnames(DR_count),":StimStatusstim")] )
+pvals = round(matrix(pvals, ncol=length(u$varnames)),8)
+rownames(pvals) = gsub('StimStatusstim', '', v[1:nrow(pvals)])
+colnames(pvals) = u$varnames
+dr_res <- data.frame(log2fc = log2(exp( summary(dr_fit_common)$coefficients[paste0(colnames(DR_count),":StimStatusstim")] )),
+                     coef =  summary(dr_fit_common)$coefficients[paste0(colnames(DR_count),":StimStatusstim")], 
+                     pval=colMeans(pvals))
+###
+rownames(dr_res) <- gsub(':StimStatusstim','',rownames(dr_res))
+dr_res$prob.ratio <- prob.ratio
+###
+dr_res$fdr <- p.adjust(dr_res$pval,method = 'BH')
+dr_results_sim_V2 <- dr_res
+```
+
+
+```{r message=FALSE, warning=FALSE}
+x <- DR_count[,]
+x <- as.data.frame(x)
+
+my_pval <- list()
+
+for(i in 1:12){
+  y <- wilcox.test(x=x[1:10,i],y=x[11:20,i])
+  my_pval[[i]]<- y$p.value
+}
+
+y <- data.frame(Marker= colnames(x),pval=unlist(my_pval))
+wilcoxon_test <- y
+```
+
+
+```{r message=FALSE, warning=FALSE}
+dr_results_sim_V2$Marker <- rownames(dr_results_sim_V2)
+dr_results_sim_V2$Marker <- factor(dr_results_sim_V2$Marker,levels = dr_results_sim_V2$Marker)
+crumblr_results_sim_V2$Marker <- rownames(crumblr_results_sim_V2)
+crumblr_results_sim_V2$Marker <- factor(crumblr_results_sim_V2$Marker,levels = levels(dr_results_sim_V2$Marker))
+crumblr_results_sim_V2 <- crumblr_results_sim_V2[order(crumblr_results_sim_V2$Marker),]
+```
+
+
+```{r message=FALSE, warning=FALSE}
+wilcoxon_test
+```
+
+```{r message=FALSE, warning=FALSE}
+dr_results_sim_V2
+```
+
+```{r message=FALSE, warning=FALSE}
+crumblr_results_sim_V2
+```
+
+```{r message=FALSE, warning=FALSE}
+#wilcoxon_test
+#dr_results_sim_V2
+#crumblr_results_sim_V2
+sumres <- data.frame(w_pval=wilcoxon_test$pval,
+           Marker=wilcoxon_test$Marker,
+           dr_pval=dr_results_sim_V2$pval,
+           dr_fc=dr_results_sim_V2$log2fc,
+           crumblr_pval=crumblr_results_sim_V2$P.Value,
+           crumblr_fc=crumblr_results_sim_V2$logFC,
+           real=logFC_range)
+```
+
+
+```{r message=FALSE, warning=FALSE}
+```
+
+
+```{r message=FALSE, warning=FALSE,fig.width=4,fig.height=4}
+ggplot(data=sumres) + aes(x=-log10(w_pval),y=-log10(dr_pval)) + geom_point()
+```
+
+```{r message=FALSE, warning=FALSE,fig.width=4,fig.height=4}
+ggplot(data=sumres) + aes(x=-log10(crumblr_pval),y=-log10(dr_pval)) + geom_point()
+```
+
+```{r message=FALSE, warning=FALSE,fig.width=4,fig.height=4}
+ggplot(data=sumres) + aes(x=-log10(w_pval),y=-log10(crumblr_pval)) + geom_point()
+```
+
+```{r message=FALSE, warning=FALSE,fig.width=4,fig.height=4}
+ggplot(data=sumres) + aes(x=(dr_fc),y=(crumblr_fc)) + geom_point() + ylim(-0.7,0.7) + xlim(-0.7,0.7)
+```
+
+```{r message=FALSE, warning=FALSE,fig.width=4,fig.height=4}
+ggplot(data=sumres) + aes(x=crumblr_fc,y=real) + geom_point()
+```
+
+```{r message=FALSE, warning=FALSE,fig.width=4,fig.height=4}
+ggplot(data=sumres) + aes(x=dr_fc,y=real) + geom_point()
+```
+
+
+```{r message=FALSE, warning=FALSE}
+summary(lm(sumres$real ~ sumres$crumblr_fc))
+```
+
+```{r message=FALSE, warning=FALSE}
+summary(lm(sumres$real ~ sumres$dr_fc))
+```
+### Test for batch correction
+Coming soon...
